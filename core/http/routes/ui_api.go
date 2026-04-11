@@ -816,7 +816,7 @@ func RegisterUIAPIRoutes(app *echo.Echo, cl *config.ModelConfigLoader, ml *model
 			items = "9"
 		}
 
-		backends, err := gallery.AvailableBackends(appConfig.BackendGalleries, appConfig.SystemState)
+		backends, err := gallery.AvailableBackendsUnfiltered(appConfig.BackendGalleries, appConfig.SystemState)
 		if err != nil {
 			xlog.Error("could not list backends from galleries", "error", err)
 			return c.JSON(http.StatusInternalServerError, map[string]any{
@@ -894,6 +894,12 @@ func RegisterUIAPIRoutes(app *echo.Echo, cl *config.ModelConfigLoader, ml *model
 			backends = backends.Paginate(pageNum, itemsNum)
 		}
 
+		// Get dev suffix from SystemState for development backend detection
+		devSuffix := ""
+		if appConfig.SystemState != nil {
+			devSuffix = appConfig.SystemState.BackendDevSuffix
+		}
+
 		// Convert backends to JSON-friendly format and deduplicate by ID
 		backendsJSON := make([]map[string]any, 0, len(backends))
 		seenBackendIDs := make(map[string]bool)
@@ -920,18 +926,21 @@ func RegisterUIAPIRoutes(app *echo.Echo, cl *config.ModelConfigLoader, ml *model
 			}
 
 			backendsJSON = append(backendsJSON, map[string]any{
-				"id":          backendID,
-				"name":        b.Name,
-				"description": b.Description,
-				"icon":        b.Icon,
-				"license":     b.License,
-				"urls":        b.URLs,
-				"tags":        b.Tags,
-				"gallery":     b.Gallery.Name,
-				"installed":   b.Installed,
-				"processing":  currentlyProcessing,
-				"jobID":       jobID,
-				"isDeletion":  isDeletionOp,
+				"id":            backendID,
+				"name":          b.Name,
+				"description":   b.Description,
+				"icon":          b.Icon,
+				"license":       b.License,
+				"urls":          b.URLs,
+				"tags":          b.Tags,
+				"gallery":       b.Gallery.Name,
+				"installed":     b.Installed,
+				"version":       b.Version,
+				"processing":    currentlyProcessing,
+				"jobID":         jobID,
+				"isDeletion":    isDeletionOp,
+				"isMeta":        b.IsMeta(),
+				"isDevelopment": b.IsDevelopment(devSuffix),
 			})
 		}
 
@@ -973,7 +982,8 @@ func RegisterUIAPIRoutes(app *echo.Echo, cl *config.ModelConfigLoader, ml *model
 			"totalPages":         totalPages,
 			"prevPage":           prevPage,
 			"nextPage":           nextPage,
-			"systemCapability":   detectedCapability,
+			"systemCapability":          detectedCapability,
+			"preferDevelopmentBackends": appConfig.PreferDevelopmentBackends,
 		})
 	}, adminMiddleware)
 
@@ -1191,6 +1201,49 @@ func RegisterUIAPIRoutes(app *echo.Echo, cl *config.ModelConfigLoader, ml *model
 		return c.JSON(200, map[string]any{
 			"success": true,
 			"message": "Backend deleted successfully",
+		})
+	}, adminMiddleware)
+
+	// Backend upgrade APIs
+	app.GET("/api/backends/upgrades", func(c echo.Context) error {
+		if applicationInstance == nil || applicationInstance.UpgradeChecker() == nil {
+			return c.JSON(200, map[string]any{})
+		}
+		return c.JSON(200, applicationInstance.UpgradeChecker().GetAvailableUpgrades())
+	}, adminMiddleware)
+
+	app.POST("/api/backends/upgrades/check", func(c echo.Context) error {
+		if applicationInstance == nil || applicationInstance.UpgradeChecker() == nil {
+			return c.JSON(200, map[string]any{})
+		}
+		applicationInstance.UpgradeChecker().TriggerCheck()
+		return c.JSON(200, applicationInstance.UpgradeChecker().GetAvailableUpgrades())
+	}, adminMiddleware)
+
+	app.POST("/api/backends/upgrade/:name", func(c echo.Context) error {
+		backendName := c.Param("name")
+		backendName, err := url.QueryUnescape(backendName)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]any{
+				"error": "invalid backend name",
+			})
+		}
+
+		uid, err := uuid.NewUUID()
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		}
+
+		galleryService.BackendGalleryChannel <- galleryop.ManagementOp[gallery.GalleryBackend, any]{
+			ID:                 uid.String(),
+			GalleryElementName: backendName,
+			Galleries:          appConfig.BackendGalleries,
+			Upgrade:            true,
+		}
+
+		return c.JSON(200, map[string]any{
+			"uuid":      uid.String(),
+			"statusUrl": fmt.Sprintf("/api/backends/job/%s", uid.String()),
 		})
 	}, adminMiddleware)
 
